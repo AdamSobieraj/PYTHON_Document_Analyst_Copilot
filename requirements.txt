@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+langgraph
+pydantic
+mcp
+httpx
+python-dotenv
+langfuse
+celery
+redis

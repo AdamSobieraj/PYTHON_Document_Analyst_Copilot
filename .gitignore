@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Wirtualne środowisko
+.venv/
+venv/
+
+# Konfiguracja z sekretami — do repo trafia tylko .env.example
+.env
+
+# IDE / OS
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+
+# Artefakty testowe i logi
+server_test.log
+query_test*.json
+query_resp*.json
+*.log
+/claude-lmstudio.bat

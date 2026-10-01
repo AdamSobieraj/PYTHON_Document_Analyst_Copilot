@@ -1,0 +1,329 @@
+# ISO Insight — stack: API + (opcjonalnie) usługi MCP / LLM w tej samej sieci.
+#
+# Usługi górne (RAG, Jira, Confluence, LLM) nie są częścią tego repo.
+# Dwie możliwości:
+#   a) działają na hostu / w osobnym stacku — nic nie trzeba zmieniać,
+#      hosty w .env muszą być osiągalne z tej sieci (dla usług na hostu
+#      użyj http://host.docker.internal:PORT/...),
+#   b) uruchamiasz je tutaj — rozkomentuj bloki poniżej i podmień obrazy
+#      (nazwy hostów muszą się zgadzać z *_URL w .env).
+#
+# Inne stacki można podłączyć do tej sieci:
+#   networks:
+#     iso-net:
+#       external: true
+#       name: iso-insight_iso-net
+
+name: iso-insight
+
+# Shared environment for the Langfuse stack (web + worker).
+# Values marked CHANGEME should be replaced with long random secrets in
+# production; they must stay consistent between the services below.
+x-langfuse-env: &langfuse-shared-env
+  NEXTAUTH_URL: "http://localhost:3000"
+  TELEMETRY_ENABLED: "false"
+  DATABASE_URL: "postgresql://postgres:iso-insight-pg@postgres:5432/postgres" # CHANGEME
+  SALT: "iso-insight-salt" # CHANGEME
+  ENCRYPTION_KEY: "9f8e7d6c5b4a39281706f5e4d3c2b1a09f8e7d6c5b4a39281706f5e4d3c2b1a0" # CHANGEME
+  CLICKHOUSE_URL: "http://clickhouse:8123"
+  CLICKHOUSE_MIGRATION_URL: "clickhouse://clickhouse:9000"
+  CLICKHOUSE_USER: "clickhouse"
+  CLICKHOUSE_PASSWORD: "iso-insight-ch" # CHANGEME
+  # Single-node setup: cluster mode would require Zookeeper (see migration errors)
+  CLICKHOUSE_CLUSTER_ENABLED: "false"
+  CLICKHOUSE_CLUSTER_NAME: "default"
+  REDIS_HOST: "redis"
+  REDIS_PORT: "6379"
+  REDIS_AUTH: "iso-insight-redis" # CHANGEME
+  LANGFUSE_S3_EVENT_UPLOAD_BUCKET: "langfuse"
+  LANGFUSE_S3_EVENT_UPLOAD_REGION: "auto"
+  LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID: "minio"
+  LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY: "iso-insight-minio" # CHANGEME
+  LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT: "http://minio:9000"
+  LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_EVENT_UPLOAD_PREFIX: "events/"
+  LANGFUSE_S3_MEDIA_UPLOAD_BUCKET: "langfuse"
+  LANGFUSE_S3_MEDIA_UPLOAD_REGION: "auto"
+  LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID: "minio"
+  LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY: "iso-insight-minio" # CHANGEME
+  LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: "http://minio:9000"
+  LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE: "true"
+  LANGFUSE_S3_MEDIA_UPLOAD_PREFIX: "media/"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: iso-insight-api:latest
+    container_name: iso-insight-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      # Langfuse runs on the compose network (overrides localhost from .env)
+      LANGFUSE_HOST: "http://langfuse-web:3000"
+      # Celery broker/backend on the compose network (overrides .env)
+      CELERY_BROKER_URL: "redis://redis-broker:6379/0"
+      CELERY_RESULT_BACKEND: "redis://redis-broker:6379/0"
+    extra_hosts:
+      # dostęp do usług działających na maszynie hosta (np. LM Studio)
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      # the API needs the broker to publish tasks; /health is 503 without it
+      redis-broker:
+        condition: service_healthy
+    networks:
+      - iso-net
+    healthcheck:
+      test: ["CMD", "python", "-c", "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=4).status == 200 else 1)"]
+      interval: 30s
+      timeout: 6s
+      retries: 3
+      start_period: 20s
+    # depends_on (usługi górne — opcjonalnie):
+    #   - rag-default
+    #   - rag-iso20022
+    #   - rag-iso8583
+    #   - jira-mcp-service
+    #   - confluence-mcp-service
+    #   - llm-service
+
+  # ── Celery broker + worker (required — the API only submits tasks,
+  #    the worker runs the analyses) ─────────────────────────────────────
+  # The dedicated broker is independent of the Langfuse redis above
+  # (that one is password-protected and bound to 127.0.0.1:6379 on the host).
+  redis-broker:
+    image: docker.io/redis:7-alpine
+    command: ["redis-server", "--maxmemory-policy", "noeviction"]
+    container_name: iso-insight-redis-broker
+    restart: unless-stopped
+    ports:
+      # 6380 on the host: 6379 is already used by the Langfuse redis
+      - "127.0.0.1:6380:6379"
+    volumes:
+      - celery_broker_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+      start_period: 2s
+    networks: [iso-net]
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: iso-insight-api:latest
+    container_name: iso-insight-worker
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Langfuse runs on the compose network (overrides localhost from .env)
+      LANGFUSE_HOST: "http://langfuse-web:3000"
+      # Celery broker/backend on the compose network (overrides .env)
+      CELERY_BROKER_URL: "redis://redis-broker:6379/0"
+      CELERY_RESULT_BACKEND: "redis://redis-broker:6379/0"
+    # One worker process: each task is a full multi-LLM analysis run with its
+    # own MCP sessions — the upstream services are the bottleneck, not CPU.
+    command: ["celery", "-A", "celery_app.celery_app", "worker", "--loglevel=info", "--pool=prefork", "-c", "1"]
+    depends_on:
+      redis-broker:
+        condition: service_healthy
+    extra_hosts:
+      # dostęp do usług działających na maszynie hosta (np. LM Studio)
+      - "host.docker.internal:host-gateway"
+    networks:
+      - iso-net
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A celery_app.celery_app inspect ping --timeout 5 || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+  # ── Usługi górne (opcjonalnie — rozkomentuj i podmień obrazy) ──────────
+  #
+  # rag-default:
+  #   image: twoj-rejestr/rag-default:latest
+  #   restart: unless-stopped
+  #   networks: [iso-net]
+  #
+  # rag-iso20022:
+  #   image: twoj-rejestr/rag-iso20022:latest
+  #   restart: unless-stopped
+  #   networks: [iso-net]
+  #
+  # rag-iso8583:
+  #   image: twoj-rejestr/rag-iso8583:latest
+  #   restart: unless-stopped
+  #   networks: [iso-net]
+  #
+  # jira-mcp-service:
+  #   image: twoj-rejestr/jira-mcp:latest
+  #   restart: unless-stopped
+  #   networks: [iso-net]
+  #   # environment:
+  #   #   JIRA_URL: ...
+  #   #   JIRA_TOKEN: ...
+  #
+  # confluence-mcp-service:
+  #   image: twoj-rejestr/confluence-mcp:latest
+  #   restart: unless-stopped
+  #   networks: [iso-net]
+  #   # environment:
+  #   #   CONFLUENCE_URL: ...
+  #   #   CONFLUENCE_TOKEN: ...
+  #
+  # llm-service:
+  #   image: twoj-rejestr/llm-gateway:latest
+  #   restart: unless-stopped
+  #   networks: [iso-net]
+
+  # ── Langfuse (LLM observability) — official self-hosted stack, v4 ────
+  # Web UI + API: http://localhost:3000
+  # The LANGFUSE_INIT_* variables bootstrap the org, project and API keys
+  # on first boot — the keys must match LANGFUSE_PUBLIC_KEY /
+  # LANGFUSE_SECRET_KEY in .env (used by the api service).
+  # The api service does NOT depend on Langfuse: tracing is opt-in and
+  # degrades gracefully if this stack is down.
+
+  langfuse-web:
+    image: docker.langfuse.com/langfuse/langfuse:4
+    ports:
+      - "3000:3000"
+    environment:
+      <<: *langfuse-shared-env
+      NEXTAUTH_SECRET: "iso-insight-nextauth" # CHANGEME
+      LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT: "http://localhost:9090"
+      LANGFUSE_S3_MEDIA_UPLOAD_INTERNAL_ENDPOINT: "http://minio:9000"
+      LANGFUSE_INIT_ORG_ID: "iso-insight-org"
+      LANGFUSE_INIT_ORG_NAME: "ISO Insight"
+      LANGFUSE_INIT_PROJECT_ID: "iso-insight-project"
+      LANGFUSE_INIT_PROJECT_NAME: "iso-insight"
+      LANGFUSE_INIT_PROJECT_PUBLIC_KEY: "pk-lf-iso-insight"
+      LANGFUSE_INIT_PROJECT_SECRET_KEY: "sk-lf-iso-insight"
+      LANGFUSE_INIT_USER_EMAIL: "admin@iso-insight.local"
+      LANGFUSE_INIT_USER_NAME: "Admin"
+      LANGFUSE_INIT_USER_PASSWORD: "iso-insight-admin" # CHANGEME
+    depends_on: &langfuse-depends-on
+      clickhouse:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks: [iso-net]
+
+  langfuse-worker:
+    image: docker.langfuse.com/langfuse/langfuse-worker:4
+    environment:
+      <<: *langfuse-shared-env
+    depends_on: *langfuse-depends-on
+    networks: [iso-net]
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /usr/bin/mc alias set local http://minio:9000 minio iso-insight-minio &&
+      /usr/bin/mc mb --ignore-existing local/langfuse &&
+      echo "langfuse bucket ready"
+    networks: [iso-net]
+    restart: "no"
+
+  clickhouse:
+    image: docker.io/clickhouse/clickhouse-server:25.12
+    ports:
+      - "127.0.0.1:8123:8123"
+      # 19000: host port 9000 may be taken by other local stacks (e.g. minio)
+      - "127.0.0.1:19000:9000"
+    environment:
+      CLICKHOUSE_USER: "clickhouse"
+      CLICKHOUSE_PASSWORD: "iso-insight-ch" # CHANGEME
+    volumes:
+      - langfuse_clickhouse_data:/var/lib/clickhouse
+      - langfuse_clickhouse_logs:/var/log/clickhouse-server
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+    networks: [iso-net]
+
+  postgres:
+    image: docker.io/postgres:17
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: "postgres"
+      POSTGRES_PASSWORD: "iso-insight-pg" # CHANGEME
+      POSTGRES_DB: "postgres"
+    volumes:
+      - langfuse_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    networks: [iso-net]
+
+  redis:
+    image: docker.io/redis:7
+    command: ["redis-server", "--requirepass", "iso-insight-redis", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - langfuse_redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a iso-insight-redis ping | grep -q PONG || exit 1"]
+      interval: 3s
+      timeout: 10s
+      retries: 10
+    networks: [iso-net]
+
+  minio:
+    image: cgr.dev/chainguard/minio
+    command: ["server", "--address", ":9000", "--console-address", ":9001", "/data"]
+    ports:
+      - "9090:9000"
+      - "127.0.0.1:9091:9001"
+    environment:
+      MINIO_ROOT_USER: "minio"
+      MINIO_ROOT_PASSWORD: "iso-insight-minio" # CHANGEME
+    volumes:
+      - langfuse_minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 1s
+      timeout: 5s
+      retries: 5
+      start_period: 1s
+    networks: [iso-net]
+
+networks:
+  iso-net:
+    driver: bridge
+
+volumes:
+  celery_broker_data:
+    driver: local
+  langfuse_postgres_data:
+    driver: local
+  langfuse_clickhouse_data:
+    driver: local
+  langfuse_clickhouse_logs:
+    driver: local
+  langfuse_minio_data:
+    driver: local
+  langfuse_redis_data:
+    driver: local
