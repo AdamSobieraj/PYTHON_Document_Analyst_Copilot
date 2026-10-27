@@ -1,0 +1,154 @@
+[project]
+name = "iso-insight"
+version = "0.1.0"
+description = "ISO multi-agent document analyst copilot (hexagonal layout, see CLAUDE.md)"
+requires-python = ">=3.12"
+dependencies = [
+    "celery",
+    "fastapi",
+    "httpx",
+    "langfuse",
+    "langgraph",
+    "mcp",
+    "pydantic",
+    "pydantic-settings",
+    "redis",
+    "uvicorn",
+]
+
+[dependency-groups]
+dev = [
+    "import-linter",
+    "mypy",
+    "pytest",
+    "pytest-asyncio",
+    "ruff",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iso_insight"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.mypy]
+strict = true
+python_version = "3.12"
+files = ["src", "tests"]
+mypy_path = "src"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+addopts = "-m 'not live and not integration'"
+markers = [
+    "live: calls a real external service (LLM / MCP) — never runs in CI",
+    "integration: needs real infra from docker compose — run via `make test-integration`",
+]
+
+[tool.importlinter]
+root_packages = ["iso_insight"]
+# Needed so the "no infra libraries in domain" contracts can name
+# external packages (celery, fastapi, ...) as forbidden modules.
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Layering: delivery -> composition -> pipeline -> agents -> retrieval -> ports -> schemas"
+type = "layers"
+layers = [
+    "iso_insight.api|iso_insight.workers",
+    "iso_insight.bootstrap",
+    "iso_insight.pipeline",
+    "iso_insight.agents",
+    "iso_insight.retrieval",
+    "iso_insight.ports",
+    "iso_insight.schemas",
+]
+
+[[tool.importlinter.contracts]]
+name = "ports import only schemas (no other domain package, no config)"
+type = "forbidden"
+source_modules = ["iso_insight.ports"]
+forbidden_modules = [
+    "iso_insight.adapters",
+    "iso_insight.agents",
+    "iso_insight.api",
+    "iso_insight.bootstrap",
+    "iso_insight.config",
+    "iso_insight.llm",
+    "iso_insight.observability",
+    "iso_insight.pipeline",
+    "iso_insight.retrieval",
+    "iso_insight.workers",
+]
+
+[[tool.importlinter.contracts]]
+name = "domain never imports adapters or the delivery layers"
+type = "forbidden"
+source_modules = [
+    "iso_insight.agents",
+    "iso_insight.llm",
+    "iso_insight.observability",
+    "iso_insight.ports",
+    "iso_insight.pipeline",
+    "iso_insight.retrieval",
+    "iso_insight.schemas",
+]
+forbidden_modules = [
+    "iso_insight.adapters",
+    "iso_insight.api",
+    "iso_insight.workers",
+]
+
+[[tool.importlinter.contracts]]
+name = "domain never imports infrastructure libraries"
+type = "forbidden"
+source_modules = [
+    "iso_insight.agents",
+    "iso_insight.llm",
+    "iso_insight.observability",
+    "iso_insight.ports",
+    "iso_insight.pipeline",
+    "iso_insight.retrieval",
+    "iso_insight.schemas",
+]
+forbidden_modules = [
+    "boto3",
+    "celery",
+    "fastapi",
+    "httpx",
+    "langfuse",
+    "mcp",
+    "openpyxl",
+    "openai",
+    "redis",
+    "sqlalchemy",
+    "uvicorn",
+]
+
+[[tool.importlinter.contracts]]
+name = "langgraph (orchestration engine) is only used in pipeline"
+type = "forbidden"
+source_modules = [
+    "iso_insight.adapters",
+    "iso_insight.agents",
+    "iso_insight.api",
+    "iso_insight.bootstrap",
+    "iso_insight.llm",
+    "iso_insight.observability",
+    "iso_insight.ports",
+    "iso_insight.retrieval",
+    "iso_insight.schemas",
+    "iso_insight.workers",
+]
+forbidden_modules = ["langgraph"]
