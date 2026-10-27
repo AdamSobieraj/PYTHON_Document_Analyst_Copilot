@@ -1,0 +1,9 @@
+# Development profile — activate with `--profile dev` or APP_PROFILE=dev.
+# Only keys that differ from default.yaml belong here (deep-merged over it).
+
+app:
+  env: "dev"
+
+# More agent iterations while iterating locally on prompt quality.
+workflow:
+  max_iterations: 5

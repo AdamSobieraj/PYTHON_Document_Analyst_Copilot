@@ -1,0 +1,27 @@
+# ============================================================================
+# BASE CONFIGURATION — always loaded; profiles override a subset of the keys.
+#
+# Mechanism: src/iso_insight/config_loader.py (see CLAUDE.md, Configuration).
+# Precedence (low -> high):
+#   config/default.yaml < config/<profile>.yaml < APP__SECTION__KEY env vars
+#   < run-level CLI flags (CLI_OVERRIDES in iso_insight.config_loader)
+#
+# Non-secret, run-level configuration only. Secrets (API keys, tokens) and
+# process settings (endpoints, backend selection) stay in .env — see
+# .env.example and iso_insight.config (pydantic-settings).
+# ============================================================================
+
+app:
+  name: "ISO Insight — Document Analyst Copilot"
+  env: "default"
+
+# Workflow tuning for run-level entry points (scripts, eval/).
+# Steer per key without touching YAML: APP__WORKFLOW__MAX_ITERATIONS=5
+workflow:
+  max_iterations: 3
+  low_confidence_threshold: 0.6
+
+# Retrieval defaults for scripts and evals (the MCP servers' own top_k
+# stays in .env — APP__RETRIEVAL__TOP_K overrides this key).
+retrieval:
+  top_k: 5
