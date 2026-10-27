@@ -46,6 +46,11 @@ python_version = "3.12"
 files = ["src", "tests"]
 mypy_path = "src"
 
+# Celery ships no type stubs; treat it as untyped rather than fail the gate.
+[[tool.mypy.overrides]]
+module = ["celery", "celery.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
@@ -137,18 +142,11 @@ forbidden_modules = [
 ]
 
 [[tool.importlinter.contracts]]
+# "protected" (direct imports only): the worker must import the pipeline
+# module that builds the graph to run it (separate prefork process), so a
+# transitive ban (type "forbidden") is unsatisfiable. The real rule is that
+# no package outside pipeline writes code against the langgraph API.
 name = "langgraph (orchestration engine) is only used in pipeline"
-type = "forbidden"
-source_modules = [
-    "iso_insight.adapters",
-    "iso_insight.agents",
-    "iso_insight.api",
-    "iso_insight.bootstrap",
-    "iso_insight.llm",
-    "iso_insight.observability",
-    "iso_insight.ports",
-    "iso_insight.retrieval",
-    "iso_insight.schemas",
-    "iso_insight.workers",
-]
-forbidden_modules = ["langgraph"]
+type = "protected"
+protected_modules = ["langgraph"]
+allowed_importers = ["iso_insight.pipeline"]

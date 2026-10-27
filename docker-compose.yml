@@ -130,7 +130,7 @@ services:
       CELERY_RESULT_BACKEND: "redis://redis-broker:6379/0"
     # One worker process: each task is a full multi-LLM analysis run with its
     # own MCP sessions — the upstream services are the bottleneck, not CPU.
-    command: ["celery", "-A", "celery_app.celery_app", "worker", "--loglevel=info", "--pool=prefork", "-c", "1"]
+    command: ["celery", "-A", "iso_insight.workers.tasks", "worker", "--loglevel=info", "--pool=prefork", "-c", "1"]
     depends_on:
       redis-broker:
         condition: service_healthy
@@ -140,7 +140,7 @@ services:
     networks:
       - iso-net
     healthcheck:
-      test: ["CMD-SHELL", "celery -A celery_app.celery_app inspect ping --timeout 5 || exit 1"]
+      test: ["CMD-SHELL", "celery -A iso_insight.workers.tasks inspect ping --timeout 5 || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3

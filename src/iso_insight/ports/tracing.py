@@ -9,7 +9,8 @@ disabled.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import Any
 
 
@@ -26,7 +27,7 @@ class Tracing(ABC):
         """Decorator factory for a traced function; the identity decorator when off."""
 
     @abstractmethod
-    def trace_attributes(self, **attributes: Any) -> Iterator[None]:
+    def trace_attributes(self, **attributes: Any) -> AbstractContextManager[None]:
         """Context manager: attach allowed attributes to the current trace.
 
         Only allow-listed keys are forwarded (user_id, session_id, tags,

@@ -1,0 +1,39 @@
+{
+  "iso_parser": {
+    "standards": ["ISO20022"],
+    "standard": "ISO20022",
+    "message_type": "pacs.002.001.08",
+    "requirements": [
+      "Wymagania standardu ISO 20022 dotyczące formatu wiadomości.",
+      "Walidacja schematów XML wiadomości."
+    ],
+    "confidence": 0.9
+  },
+  "gap_analysis": {
+    "gaps": ["Brak informacji o wersji standardu stosowanej w banku."],
+    "questions": ["Jaka wersja ISO 20022 jest wdrożona?"],
+    "confidence": 0.7
+  },
+  "impact_risk": {
+    "impact": ["Zmiana formatu wiadomości wpływa na kanał płatności SEPA."],
+    "risks": ["Ryzyko odrzucenia wiadomości przez przeciwnika."],
+    "recommendations": ["Przeprowadzić testy walidacji schematów."],
+    "confidence": 0.8
+  },
+  "draft_answer": {
+    "answer": "ISO 20022 definiuje standardowy format wiadomości dla systemów płatności.",
+    "caveats": ["Odpowiedź oparta na wybranych źródłach RAG."],
+    "confidence": 0.8
+  },
+  "reflector": {
+    "verdict": "pass",
+    "feedback": "Odpowiedź jest zgodna z źródłami.",
+    "missing": [],
+    "confidence": 0.85
+  },
+  "improve": {
+    "refined_query": "ISO 20022 pacs.002 walidacja schematu wersja 2013",
+    "search_hints": ["pacs.002.001.08", "walidacja XML"],
+    "feedback": "Doprecyzuj wyszukiwanie o wersję standardu."
+  }
+}

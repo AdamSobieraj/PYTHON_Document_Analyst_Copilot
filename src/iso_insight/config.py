@@ -113,6 +113,13 @@ class Settings(BaseSettings):
     llm_temperature: float = 0.1
     # Empty string means "do not send max_tokens" (model default applies).
     llm_max_tokens: str = ""
+    # Retry budget for transient LLM failures (429/5xx/timeouts), with backoff.
+    llm_max_retries: int = 3
+
+    # --- Langfuse tracing (optional; NoOp when keys are empty or SDK missing) ---
+    langfuse_host: str = ""
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
 
     # --- Celery / Redis broker (async queries) ---
     # Locally the broker runs in Docker, published on 127.0.0.1:6380
