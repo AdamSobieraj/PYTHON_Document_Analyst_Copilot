@@ -749,6 +749,8 @@ dependencies = [
     { name = "mcp" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "redis" },
     { name = "uvicorn" },
 ]
@@ -772,6 +774,8 @@ requires-dist = [
     { name = "mcp" },
     { name = "pydantic" },
     { name = "pydantic-settings" },
+    { name = "python-dotenv" },
+    { name = "pyyaml" },
     { name = "redis" },
     { name = "uvicorn" },
 ]

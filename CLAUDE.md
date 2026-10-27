@@ -46,7 +46,31 @@ Prescriptive rules for how the code in this repo is organized. New code and refa
 
 ## Configuration
 
-- Configuration only via environment variables (pydantic-settings), documented in `.env.example`. No hardcoded config values.
+Two complementary layers — pick the right one for each value:
+
+1. **Process settings** — endpoints, credentials, backend selection. Environment variables only (pydantic-settings, `config.py`), documented in `.env.example`. Secrets always live here, **never** in YAML.
+2. **Profiled run configuration** — non-secret, run-level configuration (scripts, `eval/`, experiments) as YAML profiles: `config/` + `config_loader.py` (mechanism below).
+
+No hardcoded config values in either layer.
+
+### Profiled YAML configuration (replicable in other projects)
+
+Mechanism (`config_loader.py` + `config/`):
+
+- `config/default.yaml` — the base configuration; holds **every** key the project has.
+- `config/<profile>.yaml` — a profile holds only the keys that differ and is **deep-merged** over the default (nested dicts merge, scalars replace).
+- Profile resolution: CLI `--profile`/`--prof` > `APP_PROFILE` env var > `default`.
+- Per-key env override: `APP__SECTION__KEY` (double underscore = one nesting level, matched case-insensitively) — the Docker/K8s steering knob; values arrive as raw strings.
+- Run-level CLI flags go through the loader's `CLI_OVERRIDES` registry (`{flag: "dotted.key"}`) — highest priority, kept deliberately small.
+- Precedence (low → high): `default.yaml` < `<profile>.yaml` < `APP__*` env < CLI flags.
+- Access: `get_settings().get("section.key", default)` — dot notation; the module-level `get_settings()` is a lazy singleton, but `Config(profile=..., config_dir=...)` is directly constructible for tests (tmp `config/`, never the repo's files) and multi-config processes.
+
+Rules for replication in another project:
+
+- The loader is pure logic: stdlib + `pyyaml` + `python-dotenv` only — no adapters, no infra imports, no client construction. It sits next to `config.py` (package root), not in a domain package.
+- Failures degrade, never crash: missing profile file → warning + base config only; unparseable YAML → error log + `{}`.
+- Each profile is a named, committed artifact: document which profiles the project ships, and keep secrets out of all of them.
+- Unit tests of the loader must cover: profile resolution order, deep merge, `APP__*` overrides (including branch creation), dot-notation access, and the fallbacks.
 
 ## Privacy & observability
 
@@ -72,7 +96,8 @@ src layout, one package, one module per responsibility:
 
 ```
 src/<pkg>/
-├── config.py        # pydantic-settings
+├── config.py        # pydantic-settings (process settings: env, secrets)
+├── config_loader.py # profiled YAML config (see Configuration section)
 ├── schemas/         # Pydantic v2 data contracts
 ├── ports/           # interfaces (ABC), zero infrastructure imports
 ├── adapters/        # implementations: storage/, db/, parsing/, llm/, tracing/, ... (only place for infra imports)
@@ -84,6 +109,7 @@ src/<pkg>/
 ├── api/             # thin delivery layer (routes, deps)
 ├── workers/         # thin delivery layer (task wrappers)
 └── bootstrap.py     # composition root: settings → adapters → context
+config/              # profiled YAML: default.yaml + <profile>.yaml (non-secret run config)
 tests/{unit,contracts,integration,fixtures}/
 eval/
 ```

@@ -12,6 +12,8 @@ dependencies = [
     "mcp",
     "pydantic",
     "pydantic-settings",
+    "python-dotenv",  # .env loading for the profiled config mechanism
+    "pyyaml",  # profiled YAML configuration (config/ + config_loader.py)
     "redis",
     "uvicorn",
 ]
@@ -46,9 +48,10 @@ python_version = "3.12"
 files = ["src", "tests"]
 mypy_path = "src"
 
-# Celery ships no type stubs; treat it as untyped rather than fail the gate.
+# Celery, PyYAML and python-dotenv ship no type stubs; treat them as untyped
+# rather than fail the gate.
 [[tool.mypy.overrides]]
-module = ["celery", "celery.*"]
+module = ["celery", "celery.*", "dotenv", "yaml"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
