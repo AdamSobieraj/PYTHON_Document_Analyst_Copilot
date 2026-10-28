@@ -84,16 +84,15 @@ Those can be added later as a controlled, human-approved action layer.
 |         |                                                    |
 |         v                                                    |
 |  Retrieval Agent                                             |
-|      / |  \                                                  |
-|     /  |   \                                                 |
-|    v   v    v                                                |
-| RAG   Jira  Confluence                                       |
-| ISO   MCP   MCP                                              |
-| RAG                                                |
-| Default / ISO20022 / ISO8583                   |
+|     /   |          \                                         |
+|    /    |           \                                        |
+|    v    v           v                                        |
+|   ISO    Jira    Confluence                                  |
+|   RAG    MCP     MCP                                         |
+|   Default / ISO20022 / ISO8583                               |
 |         |                                                    |
 |         v                                                    |
-|  Evidence Validator                                         |
+|  Evidence Validator                                          |
 |         |                                                    |
 |         v                                                    |
 |  Gap Analysis ---------------------------------------------> LLM
@@ -106,22 +105,25 @@ Those can be added later as a controlled, human-approved action layer.
 |         |                                                    |
 |         v                                                    |
 |  Reflector / Critic ---------------------------------------> LLM
-|      / \                                                     |
-| pass   fail                                                  |
-|   |      |                                                   |
-|   v      v                                                   |
-| Output Improve --------------------------------------------> LLM
-|   |      |                                                   |
-|   v      +-------------------> Retrieval                    |
-| Confidence                                                  |
-|    / \                                                       |
-| high  low                                                    |
-|   |    |                                                     |
-|   v    v                                                     |
-| Final Escalation                                             |
-|   |    |                                                     |
-|   v    v                                                     |
-|  END   END                                                   |
+|          |         \                                         |
+|          |           \                                       |
+|         v               v                                    |
+|  Output Validator    Improve -------------------------------> LLM
+|  pass / budget spent  fail                                   |
+|         |               |                                    |
+|         |               +-----> Retrieval (loop)             |
+|         |               (max_iterations budget)              |
+|         |                                                    |
+|         v                                                    |
+|  Confidence                                                  |
+|    /         \                                               |
+|   high       low                                             |
+|    |         |                                               |
+|    v         v                                               |
+|  Final       Escalation                                      |
+|    |         |                                               |
+|    v         v                                               |
+|   END        END                                             |
 +--------------------------------------------------------------+
 ```
 
@@ -217,53 +219,82 @@ The system expects structured JSON responses where possible and includes fallbac
 
 ## Project Structure
 
+The code lives in a single src-layout package (`src/iso_insight`) with a
+hexagonal (ports & adapters) architecture — the organizing rules are in
+`CLAUDE.md`:
+
 ```text
 .
 ├── .env.example
-├── requirements.txt
+├── CLAUDE.md              # code-organization rules (architecture, config, testing)
 ├── Dockerfile
+├── Makefile               # make check / make up / make down
 ├── docker-compose.yml
-├── config.py
-├── state.py
-├── guardrails.py
-├── mcp_client.py
-├── tools.py
-├── llm.py
-├── nodes.py
-├── graph.py
-├── tracing.py
-├── celery_app.py
-└── iso_multiagent_api.py
+├── pyproject.toml         # dependencies (uv) + ruff/mypy/pytest/import-linter config
+├── uv.lock
+├── config/                # profiled YAML run config (non-secret)
+│   ├── default.yaml       # every key; base for all profiles
+│   └── dev.yaml           # dev profile (deep-merged over default)
+├── src/
+│   └── iso_insight/
+│       ├── bootstrap.py           # composition root: settings → adapters → context
+│       ├── config.py              # process settings (env only) + MCP service registry
+│       ├── config_loader.py       # profiled YAML config (config/ + APP__* env + CLI)
+│       ├── exceptions.py          # domain exceptions (TransientError, …)
+│       ├── schemas/               # Pydantic v2 data contracts + workflow TypedDicts
+│       ├── ports/                 # interfaces: llm, tools, queue, tracing (zero infra)
+│       ├── adapters/              # implementations (the only place for infra imports)
+│       │   ├── llm/               #   OpenAI-compatible chat-completions client
+│       │   ├── tools/             #   MCP tool gateway (RAG / Jira / Confluence)
+│       │   ├── queue/             #   Celery + Redis task queue
+│       │   └── tracing/           #   Langfuse adapter (+ no-op when tracing is off)
+│       ├── pipeline/              # graph wiring, PipelineContext, guardrails, retry
+│       ├── agents/                # agent node logic (LLM only via the port)
+│       ├── retrieval/             # per-ISO server selection + result normalisation
+│       ├── llm/
+│       │   └── prompts/           # versioned prompt files (<name>_v<version>.md)
+│       ├── observability/         # PII detection & masking (pure logic)
+│       ├── api/                   # thin FastAPI delivery layer (routes only)
+│       └── workers/               # thin Celery delivery layer (task wrappers)
+└── tests/
+    ├── unit/                      # pure logic (guardrails, masking, nodes, retry, …)
+    ├── contracts/                 # port contract suites (fake + real adapter)
+    ├── integration/               # real infra from docker compose
+    └── fakes/                     # in-memory port implementations for tests
 ```
 
-### File Responsibilities
+### Package Responsibilities
 
-| File | Purpose |
+| Package / file | Purpose |
 |---|---|
-| `iso_multiagent_api.py` | FastAPI application and HTTP endpoints |
-| `graph.py` | LangGraph workflow definition |
-| `nodes.py` | Agent / node logic |
-| `tools.py` | MCP tool wrappers |
-| `mcp_client.py` | MCP session management |
-| `llm.py` | LLM client and JSON parsing |
-| `state.py` | Workflow state schema |
-| `guardrails.py` | Input validation |
-| `config.py` | Configuration and MCP service registry |
-| `tracing.py` | Optional Langfuse tracing (decorator + trace attributes, no-op when off) |
-| `celery_app.py` | Celery app + the query task (sole execution path); worker event loop / MCP lifecycle |
+| `iso_insight/api/` | FastAPI application and HTTP endpoints (no business logic) |
+| `iso_insight/workers/` | Celery app + the query task (sole execution path); per-process event loop / MCP lifecycle |
+| `iso_insight/pipeline/` | LangGraph workflow definition (`stages.py`), shared `PipelineContext`, input guardrails, retry with backoff |
+| `iso_insight/agents/` | Agent / node logic (`nodes.py`) |
+| `iso_insight/retrieval/` | Query shaping, per-ISO RAG routing, source normalisation |
+| `iso_insight/ports/` | Port interfaces (LLM, tool gateway, task queue, tracing) — zero infrastructure imports |
+| `iso_insight/adapters/` | Concrete implementations behind the ports (LLM client, MCP gateway, Celery queue, Langfuse / no-op tracing) |
+| `iso_insight/schemas/` | Data contracts (Pydantic v2; the workflow state is a TypedDict for LangGraph) |
+| `iso_insight/llm/prompts/` | Versioned prompt files + structured-output shapes |
+| `iso_insight/observability/` | PII detection & masking (pure logic; used by guardrails and tracing) |
+| `iso_insight/config.py` | Process settings and the MCP service registry (env vars only) |
+| `iso_insight/config_loader.py` | Profiled YAML configuration (`config/` + `APP__*` env + CLI flags) |
+| `iso_insight/bootstrap.py` | Composition root — the only place concrete adapters are chosen |
 
 ---
 
 ## Requirements
 
 ```text
-Python 3.10+
-FastAPI
+Python 3.12+
+uv         (dependency management — deps pinned in uv.lock)
+FastAPI, uvicorn
 LangGraph
-MCP client
+MCP client (mcp)
 httpx
-python-dotenv
-langfuse   (optional — enables tracing when LANGFUSE_* keys are set)
+pydantic, pydantic-settings
+python-dotenv, PyYAML   (profiled YAML configuration)
+langfuse   (tracing; a no-op when the LANGFUSE_* keys are empty)
 celery     (query queue)
 redis      (Celery broker + result backend)
 ```
@@ -272,29 +303,16 @@ redis      (Celery broker + result backend)
 
 ## Installation
 
-Create a virtual environment:
+The project uses [uv](https://docs.astral.sh/uv/) for dependency
+management; `pyproject.toml` declares the dependencies and `uv.lock`
+pins them:
 
 ```bash
-python -m venv .venv
+uv sync
 ```
 
-Activate it:
-
-```bash
-source .venv/bin/activate
-```
-
-On Windows PowerShell:
-
-```powershell
-.venv\Scripts\Activate
-```
-
-Install dependencies:
-
-```bash
-pip install -r requirements.txt
-```
+This creates `.venv` and installs every dependency plus the
+`iso_insight` package itself (src layout).
 
 Copy the example environment file:
 
@@ -310,6 +328,9 @@ copy .env.example .env
 
 Edit `.env` with your real service URLs and tokens.
 
+All commands below are shown with `uv run …`, so no manual venv
+activation is needed.
+
 ---
 
 ## Running the Application
@@ -324,10 +345,10 @@ local run instructions.
 docker compose up -d redis-broker
 
 # worker (terminal A) — runs the analyses
-celery -A celery_app.celery_app worker --loglevel=info --pool=solo
+uv run celery -A iso_insight.workers.tasks worker --loglevel=info --pool=solo
 
 # API (terminal B) — submits tasks and reports status
-uvicorn iso_multiagent_api:api --reload
+uv run uvicorn iso_insight.api.main:api --reload
 ```
 
 The API will be available at:
@@ -513,7 +534,7 @@ an unknown or expired task id is reported as `QUEUED` too):
 {
   "task_id": "4e6f1a...",
   "status": "SUCCESS",
-  "thread_id": "3f2c...",
+  "thread_id": null,
   "result": {
     "final_answer": "Based on the available sources, ISO 20022 pacs.008.001.08 requires correct payment instruction identification fields and sender/receiver data. The exact field set depends on the standard version and process context.",
     "audit_status": "ok",
@@ -569,10 +590,10 @@ Prefork is not available on Windows, so the local worker runs with the
 docker compose up -d redis-broker
 
 # 2) worker (terminal A)
-celery -A celery_app.celery_app worker --loglevel=info --pool=solo
+uv run celery -A iso_insight.workers.tasks worker --loglevel=info --pool=solo
 
 # 3) API (terminal B)
-uvicorn iso_multiagent_api:api --port 8000
+uv run uvicorn iso_insight.api.main:api --port 8000
 ```
 
 ### Running in Docker
@@ -590,9 +611,11 @@ curl http://localhost:8000/health
   several workers a thread may land on different ones. A shared (e.g.
   Postgres) checkpointer — see Roadmap — makes it durable and
   multi-worker safe.
-- The worker runs tasks one at a time by design (`-c 1` / `--pool=solo`):
-  each task is a full multi-LLM analysis run, and the upstream LLM / MCP
-  services are the bottleneck, not CPU.
+- The worker runs tasks one at a time by design (`-c 1`): each task is a
+  full multi-LLM analysis run, and the upstream LLM / MCP services are
+  the bottleneck, not CPU. In Docker it runs with `--pool=prefork`;
+  locally on Windows with `--pool=solo` (prefork is not available
+  there).
 - Task results are stored in Redis and expire after
   `CELERY_TASK_RESULT_EXPIRES` (default 24 h).
 - The worker flushes Langfuse tracing on shutdown.
@@ -620,7 +643,53 @@ If it does not have enough sources, it should escalate instead of guessing.
 
 ---
 
+## Configuration
+
+Configuration lives in two complementary layers — no hardcoded values:
+
+1. **Process settings** — endpoints, credentials, backend selection.
+   Environment variables only (pydantic-settings, `iso_insight/config.py`),
+   documented in `.env.example`. Secrets always live here, **never** in
+   YAML.
+2. **Profiled run configuration** — non-secret, run-level configuration
+   (scripts, `eval/`, experiments) as YAML profiles
+   (`iso_insight/config_loader.py` + `config/`):
+   - `config/default.yaml` holds **every** key the project has;
+   - `config/<profile>.yaml` holds only the keys that differ and is
+     **deep-merged** over the default (nested dicts merge, scalars
+     replace);
+   - profile resolution: CLI `--profile`/`--prof` > `APP_PROFILE` env var
+     > `default`;
+   - per-key env override: `APP__SECTION__KEY` (double underscore = one
+     nesting level, matched case-insensitively) — the Docker/K8s
+     steering knob;
+   - run-level CLI flags go through the loader's `CLI_OVERRIDES`
+     registry (highest priority, kept deliberately small).
+   - Precedence (low → high): `default.yaml` < `<profile>.yaml` <
+     `APP__*` env < CLI flags.
+   - Access: `get_settings().get("section.key", default)` — dot notation.
+
+The project ships two profiles: `default.yaml` (base) and `dev.yaml`
+(raised `workflow.max_iterations` for local prompt work). Examples:
+
+```bash
+# run with the dev profile
+APP_PROFILE=dev uv run python my_script.py
+
+# override a single key without touching the YAML
+APP__WORKFLOW__MAX_ITERATIONS=5 uv run python my_script.py
+```
+
+---
+
 ## Configuration Reference
+
+### Workflow tuning
+
+```env
+MAX_ITERATIONS=3
+LOW_CONFIDENCE_THRESHOLD=0.6
+```
 
 ### RAG Services
 
@@ -682,6 +751,7 @@ LLM_MODEL=bank-llm
 LLM_TIMEOUT=60
 LLM_TEMPERATURE=0.1
 LLM_MAX_TOKENS=
+LLM_MAX_RETRIES=3
 ```
 
 ### Langfuse (optional tracing)
@@ -705,6 +775,34 @@ CELERY_TASK_RESULT_EXPIRES=86400
 CELERY_TASK_SOFT_TIME_LIMIT=2400
 CELERY_TASK_TIME_LIMIT=2700
 ```
+
+---
+
+## Development
+
+Toolchain: `uv` (deps), `ruff` (lint + format), `mypy --strict`
+(types), `import-linter` (architecture contracts), `pytest`. Everything
+is wired in `pyproject.toml`; the rules themselves are in `CLAUDE.md`.
+
+```bash
+make check            # the single quality gate: lint + types + contracts + tests
+make lint             # ruff check + ruff format --check
+make types            # mypy --strict
+make contracts        # import-linter (layering + no infra imports in the domain)
+make tests            # pytest (unit + contract suites; `live`/`integration` excluded)
+make test-integration # pytest -m integration (needs compose infra: make up)
+make up / make down   # docker compose up --build -d / down
+```
+
+- Unit and contract tests run without any infrastructure: every port has
+  an in-memory fake (`tests/fakes/`), and each contract suite
+  (`tests/contracts/`) runs against both the fake and the real adapter.
+- Integration tests (`tests/integration/`) need the real infra from
+  docker compose and are excluded from the default gate.
+- Tests marked `-m live` call real external services (LLM / MCP) and
+  never run in CI.
+- A task is done only when `make check` is green. (On machines without
+  `make`, run the same commands via `uv run …` directly.)
 
 ---
 
@@ -775,8 +873,8 @@ curl http://localhost:8000/health
   `docker compose up -d redis-broker` (or point `CELERY_BROKER_URL` at your
   own Redis),
 - `"workers": 0` — the Celery worker is not running or is connected to a
-  different broker; check its log (`celery -A celery_app.celery_app worker
-  --loglevel=info --pool=solo`),
+  different broker; check its log (`uv run celery -A
+  iso_insight.workers.tasks worker --loglevel=info --pool=solo`),
 - the API and the worker must agree on `CELERY_BROKER_URL` /
   `CELERY_RESULT_BACKEND`.
 
