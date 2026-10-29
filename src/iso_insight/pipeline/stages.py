@@ -28,6 +28,7 @@ def build_workflow(ctx: PipelineContext) -> Any:
     nodes = NodeFunctions(ctx.settings, ctx.llm, ctx.tools, ctx.tracing)
 
     graph = StateGraph(WorkflowState)
+    graph.add_node("tools_gate", nodes.tools_gate)
     graph.add_node("orchestrator", nodes.orchestrator)
     graph.add_node("iso_parser", nodes.iso_parser)
     graph.add_node("retrieval", nodes.retrieval)
@@ -42,7 +43,12 @@ def build_workflow(ctx: PipelineContext) -> Any:
     graph.add_node("final_answer", nodes.final_answer)
     graph.add_node("escalate", nodes.escalate)
 
-    graph.add_edge(START, "orchestrator")
+    graph.add_edge(START, "tools_gate")
+    graph.add_conditional_edges(
+        "tools_gate",
+        nodes.route_after_tools_gate,
+        {"run": "orchestrator", "done": END},
+    )
     graph.add_edge("orchestrator", "iso_parser")
     graph.add_edge("iso_parser", "retrieval")
     graph.add_edge("retrieval", "evidence_validator")

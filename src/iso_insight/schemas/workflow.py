@@ -53,6 +53,7 @@ class WorkflowState(TypedDict, total=False):
     - input:      query, original_query, retrieval_query, user_id, permissions
     - routing:    detected_standards, selected_rag_servers
     - guardrails: blocked, block_reason
+    - gate:       tools_available
     - evidence:   iso_requirements, rag_context, sources
     - analysis:   gaps, impact
     - answer:     draft_answer, draft_caveats
@@ -72,6 +73,8 @@ class WorkflowState(TypedDict, total=False):
 
     blocked: bool
     block_reason: str
+
+    tools_available: bool
 
     iso_requirements: list[str]
     rag_context: list[str]

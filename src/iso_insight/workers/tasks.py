@@ -2,9 +2,12 @@
 
 The worker process owns a per-process event loop (the graph is async, the
 Celery task is sync), a lazily built :class:`PipelineContext` and a
-compiled workflow. All of it lives in module globals because the prefork
-pool gives every child its own module state — shared memory between
-processes is never assumed (CLAUDE.md), everything is rebuilt per process.
+compiled workflow. A daemon monitor thread re-checks MCP availability
+every ``mcp_availability_check_interval`` seconds, so a worker picks up
+upstream services that start later, without a restart. All of it lives
+in module globals because the prefork pool gives every child its own
+module state — shared memory between processes is never assumed
+(CLAUDE.md), everything is rebuilt per process.
 
 Run with:
 
@@ -15,6 +18,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import threading
+from collections.abc import Coroutine
 from typing import Any, cast
 
 from celery.result import AsyncResult
@@ -23,9 +29,17 @@ from celery.worker.control import inspect_command
 
 from iso_insight.bootstrap import build_celery_application, build_context
 from iso_insight.config import get_settings
+from iso_insight.pipeline.availability import refresh_loop
 from iso_insight.pipeline.context import PipelineContext
 from iso_insight.pipeline.stages import RECURSION_LIMIT, build_workflow
 from iso_insight.schemas.workflow import WorkflowState
+from iso_insight.workers.mcp_status import (
+    collect_status,
+    file_pids,
+    prune_stale,
+    publish_status,
+    remove_status,
+)
 
 logger = logging.getLogger("iso_insight.worker")
 
@@ -39,9 +53,14 @@ app = celery_app
 
 # Per-process state (prefork pool: each child process has its own copy).
 _loop: asyncio.AbstractEventLoop | None = None
+# Serializes event-loop usage: task coroutines and the monitor ticks share one loop.
+_loop_lock = threading.Lock()
 _ctx: PipelineContext | None = None
 _graph: Any = None
 _mcp_started = False
+# The MCP availability monitor (daemon thread), when running.
+_monitor_thread: threading.Thread | None = None
+_monitor_stop: threading.Event | None = None
 
 
 def _get_loop() -> asyncio.AbstractEventLoop:
@@ -54,7 +73,62 @@ def _get_loop() -> asyncio.AbstractEventLoop:
 
 
 def _run_async(coro: Any) -> Any:
-    return _get_loop().run_until_complete(coro)
+    """Run one coroutine on the process loop (tasks and the monitor share it)."""
+    with _loop_lock:
+        return _get_loop().run_until_complete(coro)
+
+
+def _start_mcp_monitor(ctx: PipelineContext) -> None:
+    """Start the per-process MCP availability monitor (once, after tools.start)."""
+    global _monitor_thread, _monitor_stop
+    if _monitor_thread is not None or ctx.settings.mcp_availability_check_interval <= 0:
+        return
+    _monitor_stop = threading.Event()
+    _monitor_thread = threading.Thread(
+        target=_run_mcp_monitor,
+        args=(ctx, _monitor_stop),
+        name="iso-insight-mcp-monitor",
+        daemon=True,
+    )
+    _monitor_thread.start()
+
+
+def _publish_tool_status() -> None:
+    """Publish this process's MCP status to its per-PID file.
+
+    The ``mcp_status`` inspect command runs in the worker's main process,
+    which cannot see the child's module globals — the file is the bridge.
+    """
+    if _ctx is None:
+        return
+    status = _ctx.tools.status()
+    publish_status(os.getpid(), status.connected, status.startup_errors)
+
+
+def _run_mcp_monitor(ctx: PipelineContext, stop: threading.Event) -> None:
+    def tick(coro: Coroutine[Any, Any, Any]) -> Any:
+        result = _run_async(coro)
+        _publish_tool_status()
+        return result
+
+    try:
+        refresh_loop(ctx.tools, ctx.settings.mcp_availability_check_interval, tick, stop)
+    except Exception:
+        logger.debug("MCP monitor loop ended with an error", exc_info=True)
+
+
+def _stop_mcp_monitor() -> None:
+    """Signal the monitor to stop and join it before the loop closes."""
+    global _monitor_thread, _monitor_stop
+    thread = _monitor_thread
+    stop = _monitor_stop
+    _monitor_thread = None
+    _monitor_stop = None
+    if thread is None:
+        return
+    if stop is not None:
+        stop.set()
+    thread.join(timeout=60)
 
 
 def _ensure_ready() -> PipelineContext:
@@ -66,6 +140,8 @@ def _ensure_ready() -> PipelineContext:
         _ctx = ctx
     if not _mcp_started:
         _run_async(ctx.tools.start())
+        _publish_tool_status()
+        _start_mcp_monitor(ctx)
         _mcp_started = True
     if _graph is None:
         _graph = build_workflow(ctx)
@@ -148,21 +224,50 @@ def run_query(  # type: ignore[no-untyped-def]
     }
 
 
+def _live_child_pids() -> list[int]:
+    """PIDs of this process's live prefork children (empty on any failure).
+
+    The pool object lives on the worker's consumer, not on the app, but
+    ``billiard`` — celery's process-pool implementation — records every
+    child started in this process in its own registry, and
+    ``active_children()`` drops the dead ones before returning.
+    """
+    try:
+        from billiard import active_children
+
+        return [int(proc.pid) for proc in active_children()]
+    except Exception:
+        logger.debug("billiard.active_children() introspection failed", exc_info=True)
+        return []
+
+
 @inspect_command()  # type: ignore[untyped-decorator]
-def mcp_status(self) -> dict[str, Any]:  # type: ignore[no-untyped-def]
-    """Plain-dict MCP tool status, aggregated by the queue adapter on /agent/health."""
-    if _ctx is None:
-        return {"connected": [], "startup_errors": ["worker nie zainicjalizowany"]}
-    status = _ctx.tools.status()
-    return {
-        "connected": list(status.connected),
-        "startup_errors": list(status.startup_errors),
-    }
+def mcp_status(state: Any) -> dict[str, Any]:
+    """Plain-dict MCP tool status, aggregated by the queue adapter on /agent/health.
+
+    Runs in the worker's *main* process (Celery passes the pidbox ``state``
+    as the first argument — unused here), but under the prefork pool the
+    MCP sessions live in the children — so the answer is read from the
+    children's per-PID status files, limited to their live PIDs. Pools that
+    run tasks in the same process (solo, threads) keep ``_ctx`` here and
+    answer directly.
+    """
+    if _ctx is not None:
+        status = _ctx.tools.status()
+        return {
+            "connected": list(status.connected),
+            "startup_errors": list(status.startup_errors),
+        }
+    pids = _live_child_pids() or file_pids()
+    prune_stale(pids)
+    return collect_status(pids)
 
 
 def _teardown(**kwargs: Any) -> None:
-    """Shut down MCP sessions, flush tracing and close the loop (once per process)."""
+    """Shut down the monitor, MCP sessions, tracing and the loop (once per process)."""
     global _loop, _ctx, _graph, _mcp_started
+    _stop_mcp_monitor()
+    remove_status(os.getpid())
     ctx = _ctx
     if _mcp_started and ctx is not None:
         try:

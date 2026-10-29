@@ -8,6 +8,7 @@ the same way the real gateway does when a session is missing.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from iso_insight.exceptions import ToolCallError
@@ -22,12 +23,22 @@ class FakeToolGateway(ToolGateway):
         self.calls: list[dict[str, Any]] = []
         self.started = False
         self.stopped = False
+        # Every refresh() tick, with the timeout it was given (None = default).
+        self.refresh_calls: list[float | None] = []
+        # Test hook: simulate a server coming up during a refresh tick.
+        self.on_refresh: Callable[[], None] | None = None
 
     async def start(self) -> None:
         self.started = True
 
     async def stop(self) -> None:
         self.stopped = True
+
+    async def refresh(self, timeout: float | None = None) -> ToolStatus:
+        self.refresh_calls.append(timeout)
+        if self.on_refresh is not None:
+            self.on_refresh()
+        return self.status()
 
     async def call(
         self,

@@ -48,3 +48,12 @@ class ToolGateway(ABC):
     @abstractmethod
     def status(self) -> ToolStatus:
         """Connected server names plus the collected startup errors."""
+
+    @abstractmethod
+    async def refresh(self, timeout: float | None = None) -> ToolStatus:
+        """Re-attempt the configured servers that are not connected (best effort).
+
+        Connected sessions are left untouched. ``timeout`` bounds every new
+        connection attempt (each server's configured timeout when omitted).
+        Failures are collected in the returned status, never raised.
+        """

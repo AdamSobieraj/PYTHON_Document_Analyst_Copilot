@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 
 from iso_insight.adapters.tracing.noop import NoOpTracing
+from iso_insight.agents.nodes import TOOLS_UNAVAILABLE_ANSWER
 from iso_insight.config import Settings
 from iso_insight.pipeline.context import PipelineContext
 from iso_insight.pipeline.stages import RECURSION_LIMIT, build_workflow
@@ -48,6 +49,7 @@ async def test_happy_path_completes_with_golden_responses(
         "reflector",
     ]
     assert _events(result) == [
+        "tools_gate_passed",
         "orchestrator_planned",
         "iso_parser_completed",
         "retrieval_completed",
@@ -69,6 +71,22 @@ async def test_happy_path_completes_with_golden_responses(
     assert "ISO 20022 definiuje" in final
     assert "Źródła:" in final
     assert "Zastrzeżenia:" in final
+
+
+async def test_all_tools_down_answers_without_llm(settings: Settings) -> None:
+    llm = FakeLLM()
+    tools = FakeToolGateway(sessions={})
+    tools.startup_errors = [
+        f"{name}: timeout startu (30s)" for name in sorted(settings.mcp_servers)
+    ]
+    result = await _run(settings, llm, tools)
+    assert result["audit_status"] == "tools_unavailable"
+    assert result["final_answer"] == TOOLS_UNAVAILABLE_ANSWER
+    assert result["confidence"] == 0.0
+    assert result["sources"] == []
+    assert _events(result) == ["tools_unavailable"]
+    assert result["audit_log"][-1]["startup_errors"] == tools.startup_errors
+    assert llm.calls == []  # the gate short-circuits: the LLM is never touched
 
 
 async def test_no_sources_escalates_after_budget(

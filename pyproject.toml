@@ -48,10 +48,10 @@ python_version = "3.12"
 files = ["src", "tests"]
 mypy_path = "src"
 
-# Celery, PyYAML and python-dotenv ship no type stubs; treat them as untyped
-# rather than fail the gate.
+# Celery, its billiard process pool, PyYAML and python-dotenv ship no type
+# stubs; treat them as untyped rather than fail the gate.
 [[tool.mypy.overrides]]
-module = ["celery", "celery.*", "dotenv", "yaml"]
+module = ["celery", "celery.*", "billiard", "billiard.*", "dotenv", "yaml"]
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

@@ -51,6 +51,25 @@ async def test_stop_is_idempotent(gateway: ToolGateway) -> None:
     await gateway.stop()
 
 
+async def test_refresh_is_best_effort_and_keeps_status_well_formed(
+    gateway: ToolGateway,
+) -> None:
+    # refresh never raises (even when every server is down) and returns a
+    # well-formed status — the monitor and the tools_gate both rely on it.
+    await gateway.start()
+    status = await gateway.refresh(timeout=1.0)
+    assert isinstance(status, ToolStatus)
+    assert isinstance(status.connected, list)
+    assert isinstance(status.startup_errors, list)
+
+
+async def test_refresh_never_drops_connected_servers(gateway: ToolGateway) -> None:
+    await gateway.start()
+    before = set(gateway.status().connected)
+    after = await gateway.refresh(timeout=1.0)
+    assert before <= set(after.connected)
+
+
 async def test_mcp_accounting_covers_every_configured_server(settings: Settings) -> None:
     # Environment-independent MCP guarantee: every configured server ends up
     # either connected or in startup_errors — never silently dropped.
@@ -58,6 +77,21 @@ async def test_mcp_accounting_covers_every_configured_server(settings: Settings)
     await gateway.start()
     try:
         status = gateway.status()
+        configured = set(settings.mcp_servers)
+        assert set(status.connected) <= configured
+        assert len(status.connected) + len(status.startup_errors) == len(configured)
+    finally:
+        await gateway.stop()
+
+
+async def test_mcp_refresh_keeps_the_accounting_invariant(settings: Settings) -> None:
+    # Reconnection attempts must not break the invariant: after a refresh
+    # tick every configured server is either connected or has one recorded
+    # error (stale errors for servers that did connect are dropped).
+    gateway = MCPToolGateway(settings)
+    await gateway.start()
+    try:
+        status = await gateway.refresh(timeout=1.0)
         configured = set(settings.mcp_servers)
         assert set(status.connected) <= configured
         assert len(status.connected) + len(status.startup_errors) == len(configured)

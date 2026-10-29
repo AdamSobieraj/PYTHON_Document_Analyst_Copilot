@@ -2,12 +2,16 @@
 
 Pipeline (wiring lives in :mod:`iso_insight.pipeline.stages`):
 
-    orchestrator -> iso_parser -> retrieval -> evidence
+    tools_gate -> orchestrator -> iso_parser -> retrieval -> evidence
     -> gap_analysis -> impact_risk -> draft_answer -> reflector
     -> (improve -> retrieval loop, bounded by max_iterations)
     -> output_validator -> confidence_check -> final_answer | escalate
 
 Notes:
+- tools_gate runs first: with no MCP server connected it makes one short
+  reconnect probe and, if still none, ends the run there with a
+  deterministic "service unavailable" answer (audit_status
+  "tools_unavailable") — zero LLM calls.
 - Input guardrails (PII / prompt injection) are NOT a node here — they
   run at the API boundary before the task is enqueued (see
   :mod:`iso_insight.pipeline.guardrails`).
@@ -40,6 +44,13 @@ from iso_insight.retrieval.search import (
 from iso_insight.schemas.workflow import SourceRef, WorkflowState, append_audit
 
 SearchFunc = Callable[..., Awaitable[list[SourceRef]]]
+
+# The tools_gate short-circuit answer: deterministic, no LLM involved.
+TOOLS_UNAVAILABLE_ANSWER = (
+    "Usługa analityczna jest aktualnie niedostępna. "
+    "Spróbuj ponownie później lub poinformuj administratora."
+)
+TOOLS_UNAVAILABLE_STATUS = "tools_unavailable"
 
 
 def _clean_list(value: Any) -> list[str]:
@@ -110,7 +121,7 @@ async def _safe_search(
 
 
 class NodeFunctions:
-    """The 13 workflow nodes + 2 routers, with all ports injected.
+    """The 14 workflow nodes + 3 routers, with all ports injected.
 
     Each public node is the traced version of a ``_``-prefixed private
     method (the tracing span is attached here — the domain never imports
@@ -130,6 +141,7 @@ class NodeFunctions:
         self._tools = tools
         self._tracing = tracing
         observe = tracing.observe
+        self.tools_gate = observe(name="agent.tools_gate")(self._tools_gate)
         self.orchestrator = observe(name="agent.orchestrator")(self._orchestrator)
         self.iso_parser = observe(name="agent.iso_parser")(self._iso_parser)
         self.retrieval = observe(name="agent.retrieval")(self._retrieval)
@@ -146,6 +158,10 @@ class NodeFunctions:
 
     # ── routing ──────────────────────────────────────────────────────────
 
+    def route_after_tools_gate(self, state: WorkflowState) -> str:
+        """Gate decision: a server is connected -> run, none -> done (END)."""
+        return "run" if state.get("tools_available") else "done"
+
     def route_after_reflector(self, state: WorkflowState) -> str:
         """Critic decision: pass (or budget spent) -> output; fail -> improve loop."""
         if int(state.get("iteration", 0)) >= self._settings.max_iterations:
@@ -160,6 +176,28 @@ class NodeFunctions:
         return "final" if confidence >= self._settings.low_confidence_threshold else "escalate"
 
     # ── nodes ────────────────────────────────────────────────────────────
+
+    async def _tools_gate(self, state: WorkflowState) -> WorkflowState:
+        """Availability gate: no connected MCP server -> deterministic fast answer.
+
+        With an empty gateway, makes exactly one short reconnect probe
+        (``mcp_probe_timeout``) — the background monitor may have reconnected
+        a server moments earlier, or the probe may catch one that just came
+        up. If still nothing is connected, the run ends here: a deterministic
+        "service unavailable" answer, no LLM calls, no escalation noise.
+        """
+        status = self._tools.status()
+        if not status.connected:
+            status = await self._tools.refresh(timeout=self._settings.mcp_probe_timeout)
+        if status.connected:
+            state["tools_available"] = True
+            return append_audit(state, "tools_gate_passed", servers=status.connected)
+        state["tools_available"] = False
+        state["final_answer"] = TOOLS_UNAVAILABLE_ANSWER
+        state["audit_status"] = TOOLS_UNAVAILABLE_STATUS
+        state["confidence"] = 0.0
+        state["sources"] = []
+        return append_audit(state, "tools_unavailable", startup_errors=status.startup_errors)
 
     def _orchestrator(self, state: WorkflowState) -> WorkflowState:
         """Start a new run: reset per-run state from the current query.

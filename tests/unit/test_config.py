@@ -59,5 +59,19 @@ def test_standard_map() -> None:
     assert RAG_STANDARD_MAP == {"ISO20022": "rag_iso20022", "ISO8583": "rag_iso8583"}
 
 
+def test_mcp_availability_defaults() -> None:
+    s = _settings()
+    assert s.mcp_availability_check_interval == 60
+    assert s.mcp_probe_timeout == 5.0
+
+
+def test_mcp_availability_env_overrides(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_AVAILABILITY_CHECK_INTERVAL", "0")
+    monkeypatch.setenv("MCP_PROBE_TIMEOUT", "2.5")
+    s = _settings()
+    assert s.mcp_availability_check_interval == 0
+    assert s.mcp_probe_timeout == 2.5
+
+
 def test_get_settings_cached() -> None:
     assert get_settings() is get_settings()

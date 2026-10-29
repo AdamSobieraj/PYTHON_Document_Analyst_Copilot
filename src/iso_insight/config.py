@@ -131,6 +131,14 @@ class Settings(BaseSettings):
     celery_task_soft_time_limit: int = 2400
     celery_task_time_limit: int = 2700
 
+    # --- MCP availability (worker side) ---
+    # How often (seconds) the worker re-checks MCP servers that are not
+    # connected yet; 0 disables the background checks.
+    mcp_availability_check_interval: int = 60
+    # Timeout (seconds) of the one-shot reconnect probe the workflow makes
+    # before answering when no MCP server is connected.
+    mcp_probe_timeout: float = 5.0
+
     _mcp_servers: dict[str, MCPServerConfig] = PrivateAttr()
 
     def __init__(self, **data: Any) -> None:
