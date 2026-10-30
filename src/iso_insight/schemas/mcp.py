@@ -21,6 +21,10 @@ class MCPServerConfig(BaseModel):
     tool: str
     timeout: float = 30.0
     top_k: int = 5
+    # Optional knowledge-base collection for RAG tools that require one
+    # (e.g. the native server's ``query_knowledge_base``); None = the tool
+    # uses its own default.
+    collection: str | None = None
 
 
 class ToolStatus(BaseModel):

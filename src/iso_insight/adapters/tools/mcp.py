@@ -1,13 +1,17 @@
-"""MCP tool gateway: one long-lived client session per configured server.
+"""MCP tool gateway: one long-lived client session per configured endpoint.
 
 Implements the :class:`~iso_insight.ports.tools.ToolGateway` port over
-the ``mcp`` SDK. Startup is best-effort per server: a failing server is
-recorded in ``ToolStatus.startup_errors`` and the workflow degrades to
-the sources that did load. ``refresh`` re-attempts only the servers that
-are not connected, so a worker picks up upstream services that start
-later without a restart. Tool-call failures are mapped onto the domain
-exceptions (``TransientToolCallError`` for timeouts and transport
-errors, ``ToolCallError`` for permanent ones).
+the ``mcp`` SDK. Several configured servers may point at the same
+endpoint (transport + url + headers, e.g. the three RAG names on one
+native server) — they share one physical session, while the status stays
+per server name. Startup is best-effort per endpoint: a failing endpoint
+is recorded in ``ToolStatus.startup_errors`` (for every name on it) and
+the workflow degrades to the sources that did load. ``refresh`` re-attempts
+only the servers that are not connected, so a worker picks up upstream
+services that start later without a restart. Tool-call failures are mapped
+onto the domain exceptions (``TransientToolCallError`` for timeouts and
+transport errors, ``ToolCallError`` for permanent ones — with the
+server's error text, so schema rejections are visible in the audit trail).
 """
 
 from __future__ import annotations
@@ -39,6 +43,12 @@ try:  # mcp 2.x wants an owned httpx2 client; 1.x takes headers/timeout directly
 except Exception:  # pragma: no cover - version-dependent
     httpx2 = None  # type: ignore[assignment]
 
+# (transport, url, sorted headers) — the identity of one physical MCP endpoint.
+EndpointKey = tuple[str, str, tuple[tuple[str, str], ...]]
+
+# How much of the server's error text lands in the domain exception.
+_ERROR_DETAIL_LIMIT = 300
+
 
 def _streamable_http_params() -> set[str]:
     """Parameter names of the installed streamable_http_client (mcp version detection)."""
@@ -59,14 +69,29 @@ def _result_field(result: Any, *names: str) -> Any:
     return None
 
 
+def _result_text(result: Any) -> str:
+    """Concatenated text blocks of the tool result (empty when there are none)."""
+    blocks = _result_field(result, "content") or []
+    parts = [block.get("text", "") for block in blocks if isinstance(block, dict)]
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _error_detail(result: Any) -> str:
+    """The server's error text for the exception message, truncated with an ellipsis."""
+    text = _result_text(result)
+    if not text:
+        return ""
+    if len(text) > _ERROR_DETAIL_LIMIT:
+        text = text[:_ERROR_DETAIL_LIMIT] + "…"
+    return f": {text}"
+
+
 def _parse_mcp_result(result: Any) -> Any:
     """Extract the tool payload: structured content first, else concatenated text blocks."""
     structured = _result_field(result, "structured_content", "structuredContent")
     if structured is not None:
         return structured
-    blocks = _result_field(result, "content") or []
-    parts = [block.get("text", "") for block in blocks if isinstance(block, dict)]
-    combined = "\n".join(part for part in parts if part).strip()
+    combined = _result_text(result)
     if not combined:
         return {}
     try:
@@ -76,23 +101,27 @@ def _parse_mcp_result(result: Any) -> Any:
 
 
 class MCPToolGateway(ToolGateway):
-    """One MCP session per configured server; start/stop are idempotent."""
+    """One MCP session per endpoint; names on it share the session. Idempotent."""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._sessions: dict[str, Any] = {}
-        self._contexts: list[tuple[str, Any, Any]] = []
-        self._owned_clients: dict[str, Any] = {}
+        self._endpoints: dict[EndpointKey, tuple[Any, Any]] = {}
+        self._owned_clients: dict[EndpointKey, Any] = {}
         # Last recorded failure reason per configured server (dropped on success).
         self._last_errors: dict[str, str] = {}
         # Servers with a connection attempt in flight (guards monitor ticks
         # against gate probes racing on the same server).
         self._pending: set[str] = set()
 
+    @staticmethod
+    def _endpoint_key(cfg: MCPServerConfig) -> EndpointKey:
+        return (cfg.transport, cfg.url, tuple(sorted(cfg.headers.items())))
+
     async def start(self) -> None:
-        """Open a session to every configured server; failures are collected, not raised."""
+        """Open a session to every configured endpoint; failures are collected, not raised."""
         self._last_errors = {}
-        if self._contexts:
+        if self._endpoints:
             await self.stop()
         if ClientSession is None or streamable_http_client is None or sse_client is None:
             for server_name in self._settings.mcp_servers:
@@ -113,32 +142,55 @@ class MCPToolGateway(ToolGateway):
     async def _connect_missing(self, timeout: float | None) -> None:
         """Connect every configured server that is not (yet) connected.
 
-        Attempts run in parallel (gathered), so a monitor tick or a gate
-        probe never serialises on the slowest dead server.
+        Servers sharing one endpoint share one physical session; names on
+        an already-connected endpoint are attached without a new
+        connection. Attempts run in parallel (gathered), so a monitor tick
+        or a gate probe never serialises on the slowest dead server.
         """
-        attempts = [
-            self._attempt_one(server_name, cfg, timeout)
-            for server_name, cfg in self._settings.mcp_servers.items()
-            if server_name not in self._sessions and server_name not in self._pending
-        ]
-        if attempts:
+        groups: dict[EndpointKey, list[str]] = {}
+        for server_name, cfg in self._settings.mcp_servers.items():
+            if server_name in self._sessions or server_name in self._pending:
+                continue
+            endpoint = self._endpoint_key(cfg)
+            if endpoint in self._endpoints:
+                # Already connected (another name on the same endpoint).
+                _, session = self._endpoints[endpoint]
+                self._sessions[server_name] = session
+                continue
+            groups.setdefault(endpoint, []).append(server_name)
+        if groups:
+            attempts = [
+                self._attempt_endpoint(endpoint, names, timeout)
+                for endpoint, names in groups.items()
+            ]
             await asyncio.gather(*attempts)
 
-    async def _attempt_one(
-        self, server_name: str, cfg: MCPServerConfig, timeout: float | None
+    async def _attempt_endpoint(
+        self,
+        endpoint: EndpointKey,
+        names: list[str],
+        timeout: float | None,
     ) -> None:
-        """Connect one server in a child task; record the outcome in ``_last_errors``.
+        """Connect one endpoint in a child task; record the outcome for every name on it.
 
-        One child task per server: the MCP SDK's internal anyio cancel scopes
+        One child task per endpoint: the MCP SDK's internal anyio cancel scopes
         cancel the task they run in. A dead server must die in its own task,
         otherwise the leaked CancelledError poisons every later anyio
         checkpoint in this process (the task's cancelling() stays > 0).
         """
-        limit = cfg.timeout if timeout is None else timeout
-        self._pending.add(server_name)
+        cfgs = [self._settings.mcp_servers[name] for name in names]
+        cfg = cfgs[0]
+        limit = max(c.timeout for c in cfgs) if timeout is None else timeout
+        for name in names:
+            self._pending.add(name)
+
+        def _record(reason: str) -> None:
+            for name in names:
+                self._last_errors[name] = reason
+
         try:
             task = asyncio.create_task(
-                self._start_one(server_name, cfg, limit), name=f"mcp-start-{server_name}"
+                self._start_endpoint(endpoint, cfg, limit), name=f"mcp-start-{cfg.url}"
             )
             try:
                 await asyncio.wait_for(task, timeout=limit)
@@ -148,27 +200,30 @@ class MCPToolGateway(ToolGateway):
                     # Cancelled from outside (shutdown, test teardown) — propagate.
                     task.cancel()
                     raise
-                self._last_errors[server_name] = "przerwane podczas startu"
+                _record("przerwane podczas startu")
             except TimeoutError:
-                self._last_errors[server_name] = f"timeout startu ({limit:.0f}s)"
+                _record(f"timeout startu ({limit:.0f}s)")
             except BaseException as exc:
-                logger.exception("MCP server connection failed: %s", server_name)
-                self._last_errors[server_name] = exc.__class__.__name__
+                logger.exception("MCP endpoint connection failed: %s", cfg.url)
+                _record(exc.__class__.__name__)
             else:
-                self._last_errors.pop(server_name, None)
+                _, session = self._endpoints[endpoint]
+                for name in names:
+                    self._last_errors.pop(name, None)
+                    self._sessions[name] = session
         finally:
-            self._pending.discard(server_name)
+            for name in names:
+                self._pending.discard(name)
 
-    async def _start_one(
-        self, server_name: str, cfg: MCPServerConfig, timeout: float | None = None
+    async def _start_endpoint(
+        self, endpoint: EndpointKey, cfg: MCPServerConfig, limit: float
     ) -> None:
-        limit = cfg.timeout if timeout is None else timeout
         if cfg.transport == "streamable_http":
             if "http_client" in _streamable_http_params() and httpx2 is not None:
                 owned_client = httpx2.AsyncClient(
                     headers=cfg.headers, timeout=httpx2.Timeout(limit)
                 )
-                self._owned_clients[server_name] = owned_client
+                self._owned_clients[endpoint] = owned_client
                 client_cm = streamable_http_client(cfg.url, http_client=owned_client)
             else:  # mcp 1.x signature
                 client_cm = streamable_http_client(  # type: ignore[call-arg]
@@ -190,35 +245,37 @@ class MCPToolGateway(ToolGateway):
         except BaseException:
             # initialize() can fail after the session was entered — close it then,
             # not just the client context.
-            await self._teardown_one(server_name, client_cm, session if session_entered else None)
-            self._owned_clients.pop(server_name, None)
+            await self._teardown_endpoint(endpoint, client_cm, session if session_entered else None)
             raise
-        self._sessions[server_name] = session
-        self._contexts.append((server_name, client_cm, session))
+        self._endpoints[endpoint] = (client_cm, session)
 
-    async def _teardown_one(self, server_name: str, client_cm: Any, session: Any | None) -> None:
+    async def _teardown_endpoint(
+        self, endpoint: EndpointKey, client_cm: Any, session: Any | None
+    ) -> None:
+        url = endpoint[1]
         if session is not None:
             try:
                 await session.__aexit__(None, None, None)
             except Exception:
-                logger.debug("MCP session close failed: %s", server_name, exc_info=True)
+                logger.debug("MCP session close failed: %s", url, exc_info=True)
         try:
             await client_cm.__aexit__(None, None, None)
         except Exception:
-            logger.debug("MCP client close failed: %s", server_name, exc_info=True)
-        owned_client = self._owned_clients.pop(server_name, None)
+            logger.debug("MCP client close failed: %s", url, exc_info=True)
+        owned_client = self._owned_clients.pop(endpoint, None)
         if owned_client is not None:
             try:
                 await owned_client.aclose()
             except Exception:
-                logger.debug("MCP http client close failed: %s", server_name, exc_info=True)
+                logger.debug("MCP http client close failed: %s", url, exc_info=True)
 
     async def stop(self) -> None:
         """Close every session (idempotent — safe to call twice)."""
-        while self._contexts:
-            server_name, client_cm, session = self._contexts.pop()
-            await self._teardown_one(server_name, client_cm, session)
-            self._sessions.pop(server_name, None)
+        for endpoint, (client_cm, session) in list(self._endpoints.items()):
+            await self._teardown_endpoint(endpoint, client_cm, session)
+            self._endpoints.pop(endpoint, None)
+        # Every name shared its endpoint's session; drop all name entries.
+        self._sessions.clear()
         self._owned_clients.clear()
 
     async def call(
@@ -246,7 +303,9 @@ class MCPToolGateway(ToolGateway):
                 f"Wywołanie narzędzia niepowodzone: {server}/{tool}: {exc}"
             ) from exc
         if _result_field(result, "isError", "is_error"):
-            raise ToolCallError(f"Narzędzie zwróciło błąd: {server}/{tool}")
+            # The server's own error text (e.g. a pydantic schema rejection) is
+            # part of the message — otherwise rejections are invisible upstream.
+            raise ToolCallError(f"Narzędzie zwróciło błąd: {server}/{tool}{_error_detail(result)}")
         return _parse_mcp_result(result)
 
     def status(self) -> ToolStatus:

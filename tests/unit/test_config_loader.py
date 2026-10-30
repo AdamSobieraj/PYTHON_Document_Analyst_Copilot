@@ -42,10 +42,14 @@ app:
 
 @pytest.fixture(autouse=True)
 def _clean_profile_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """No ambient profile machinery may leak into these tests."""
+    """No ambient profile machinery (or the repo's .env) may leak into these tests."""
     monkeypatch.delenv("APP_PROFILE", raising=False)
     for key in [key for key in os.environ if key.startswith("APP__")]:
         monkeypatch.delenv(key, raising=False)
+    # Config() calls load_dotenv(); in the test process it would pull the repo's
+    # .env into os.environ and leak RAG_*/LLM_* values into every later test
+    # (the loader tests use a tmp config/ and monkeypatched env, never the repo files).
+    monkeypatch.setattr(config_loader, "load_dotenv", lambda *args, **kwargs: False)
 
 
 @pytest.fixture

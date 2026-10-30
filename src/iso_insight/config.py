@@ -42,6 +42,9 @@ class MCPServerEnv(BaseSettings):
     tool: str = ""
     timeout: float = 30.0
     top_k: int = 5
+    # RAG knowledge-base collection (empty = not configured → None in the
+    # shared contract, see ``as_entry``).
+    collection: str = ""
 
     def as_entry(self) -> MCPServerConfig:
         """Translate the flat env settings into the shared data contract."""
@@ -56,6 +59,7 @@ class MCPServerEnv(BaseSettings):
             tool=self.tool,
             timeout=self.timeout,
             top_k=self.top_k,
+            collection=self.collection or None,
         )
 
 

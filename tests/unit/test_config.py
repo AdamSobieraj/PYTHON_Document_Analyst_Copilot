@@ -46,12 +46,22 @@ def test_mcp_registry() -> None:
     assert rag.tool == "rag_search"
     assert rag.top_k == 5
     assert rag.headers == {}
+    assert rag.collection is None
 
 
 def test_mcp_token_becomes_bearer_header(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("JIRA_MCP_TOKEN", "secret-token")
     s = _settings()
     assert s.mcp_servers["jira"].headers == {"Authorization": "Bearer secret-token"}
+
+
+def test_mcp_collection_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RAG_ISO20022_MCP_COLLECTION", "custom_kb")
+    s = _settings()
+    assert s.mcp_servers["rag_iso20022"].collection == "custom_kb"
+    # Other servers stay unset.
+    assert s.mcp_servers["rag_default"].collection is None
+    assert s.mcp_servers["jira"].collection is None
 
 
 def test_standard_map() -> None:
